@@ -22,6 +22,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"regexp"
@@ -42,6 +43,34 @@ type httpBackend struct {
 
 type checkResponseHeadersFunc func(req *http.Request, statusCode int, header http.Header) bool
 type checkRequestHeadersFunc func(req *http.Request) bool
+
+// checkCachedRedirectsFunc re-validates the redirect chain recorded in a
+// cache entry against the collector's current configuration. It returns
+// refetch=true when the chain cannot be replayed from cache (e.g. a
+// custom redirect handler is set) and the request must be sent to the
+// origin server instead. A non-nil error rejects the cached response:
+// neither the cached body is delivered nor the origin server contacted.
+type checkCachedRedirectsFunc func(hops []string) (refetch bool, err error)
+
+// cachedResponse is the on-disk cache entry format for GET responses.
+// It extends Response with the final (post-redirect) request URL and the
+// redirect chain so that a cache hit can reproduce the same Request.URL
+// (and thus the same relative-link resolution) as a live fetch, and can
+// re-validate every redirect hop against the collector's current
+// domain/URL filters and revisit rules.
+//
+// Cache files written by older versions contain a bare gob-encoded
+// Response. Those decode into cachedResponse with an empty FinalURL and
+// are treated as misses: the request falls back to the origin server and
+// the entry is rewritten in the new format.
+type cachedResponse struct {
+	Response
+	// FinalURL is the request URL after all redirects have been followed.
+	FinalURL string
+	// Hops contains the redirect target URLs in the order they were
+	// followed. It is empty when no redirect occurred.
+	Hops []string
+}
 
 // LimitRule provides connection restrictions for domains.
 // Both DomainRegexp and DomainGlob can be used to specify
@@ -154,9 +183,10 @@ func (h *httpBackend) GetMatchingRule(domain string) *LimitRule {
 	return nil
 }
 
-func (h *httpBackend) Cache(request *http.Request, bodySize int, checkRequestHeadersFunc checkRequestHeadersFunc, checkResponseHeadersFunc checkResponseHeadersFunc, cacheDir string, cacheExpiration time.Duration) (*Response, error) {
+func (h *httpBackend) Cache(request *http.Request, bodySize int, checkRequestHeadersFunc checkRequestHeadersFunc, checkResponseHeadersFunc checkResponseHeadersFunc, checkCachedRedirectsFunc checkCachedRedirectsFunc, cacheDir string, cacheExpiration time.Duration) (*Response, error) {
 	if cacheDir == "" || request.Method != "GET" || request.Header.Get("Cache-Control") == "no-cache" {
-		return h.Do(request, bodySize, checkRequestHeadersFunc, checkResponseHeadersFunc)
+		resp, _, err := h.Do(request, bodySize, checkRequestHeadersFunc, checkResponseHeadersFunc)
+		return resp, err
 	}
 	sum := sha1.Sum([]byte(request.URL.String()))
 	hash := hex.EncodeToString(sum[:])
@@ -170,15 +200,45 @@ func (h *httpBackend) Cache(request *http.Request, bodySize int, checkRequestHea
 	}
 
 	if file, err := os.Open(filename); err == nil {
-		resp := new(Response)
-		err := gob.NewDecoder(file).Decode(resp)
+		entry := new(cachedResponse)
+		decodeErr := gob.NewDecoder(file).Decode(entry)
 		file.Close()
-		checkResponseHeadersFunc(request, resp.StatusCode, *resp.Headers)
-		if resp.StatusCode < 500 {
-			return resp, err
+		// Old-format entries (bare Response, no FinalURL), corrupted
+		// entries and 5xx responses are treated as misses and refreshed
+		// from the origin server below.
+		if decodeErr == nil && entry.FinalURL != "" && entry.Headers != nil && entry.StatusCode < 500 {
+			refetch, err := checkCachedRedirectsFunc(entry.Hops)
+			if err != nil {
+				// A redirect hop recorded in the entry is rejected by
+				// the collector's current configuration: deliver
+				// neither the cached body nor a fresh request.
+				return nil, err
+			}
+			if !refetch {
+				// Replay the final request URL so that Request.URL,
+				// and with it relative link resolution in the HTML/XML
+				// callbacks, matches a live fetch.
+				finalRequest := request
+				if entry.FinalURL != request.URL.String() {
+					if u, err := url.Parse(entry.FinalURL); err == nil {
+						r2 := new(http.Request)
+						*r2 = *request
+						r2.URL = u
+						finalRequest = r2
+					}
+				}
+				if !checkResponseHeadersFunc(finalRequest, entry.StatusCode, *entry.Headers) {
+					return nil, ErrAbortedAfterHeaders
+				}
+				return &Response{
+					StatusCode: entry.StatusCode,
+					Body:       entry.Body,
+					Headers:    entry.Headers,
+				}, nil
+			}
 		}
 	}
-	resp, err := h.Do(request, bodySize, checkRequestHeadersFunc, checkResponseHeadersFunc)
+	resp, finalURL, err := h.Do(request, bodySize, checkRequestHeadersFunc, checkResponseHeadersFunc)
 	if err != nil || resp.StatusCode >= 500 {
 		return resp, err
 	}
@@ -191,7 +251,16 @@ func (h *httpBackend) Cache(request *http.Request, bodySize int, checkRequestHea
 	if err != nil {
 		return resp, err
 	}
-	if err := gob.NewEncoder(file).Encode(resp); err != nil {
+	entry := &cachedResponse{Response: *resp}
+	if finalURL != nil {
+		entry.FinalURL = finalURL.String()
+	} else {
+		entry.FinalURL = request.URL.String()
+	}
+	if chain, ok := request.Context().Value(redirectHopsKey).(*redirectChain); ok {
+		entry.Hops = chain.hops
+	}
+	if err := gob.NewEncoder(file).Encode(entry); err != nil {
 		file.Close()
 		return resp, err
 	}
@@ -199,7 +268,7 @@ func (h *httpBackend) Cache(request *http.Request, bodySize int, checkRequestHea
 	return resp, os.Rename(filename+"~", filename)
 }
 
-func (h *httpBackend) Do(request *http.Request, bodySize int, checkRequestHeadersFunc checkRequestHeadersFunc, checkResponseHeadersFunc checkResponseHeadersFunc) (*Response, error) {
+func (h *httpBackend) Do(request *http.Request, bodySize int, checkRequestHeadersFunc checkRequestHeadersFunc, checkResponseHeadersFunc checkResponseHeadersFunc) (*Response, *url.URL, error) {
 	r := h.GetMatchingRule(request.URL.Host)
 	if r != nil {
 		r.waitChan <- true
@@ -213,11 +282,11 @@ func (h *httpBackend) Do(request *http.Request, bodySize int, checkRequestHeader
 		}(r)
 	}
 	if !checkRequestHeadersFunc(request) {
-		return nil, ErrAbortedBeforeRequest
+		return nil, nil, ErrAbortedBeforeRequest
 	}
 	res, err := h.Client.Do(request)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer res.Body.Close()
 
@@ -228,7 +297,7 @@ func (h *httpBackend) Do(request *http.Request, bodySize int, checkRequestHeader
 	if !checkResponseHeadersFunc(finalRequest, res.StatusCode, res.Header) {
 		// closing res.Body (see defer above) without reading it aborts
 		// the download
-		return nil, ErrAbortedAfterHeaders
+		return nil, nil, ErrAbortedAfterHeaders
 	}
 
 	var bodyReader io.Reader = res.Body
@@ -251,23 +320,23 @@ func (h *httpBackend) Do(request *http.Request, bodySize int, checkRequestHeader
 			if magic[0] == 0x1f && magic[1] == 0x8b {
 				bodyReader, err = gzip.NewReader(bufReader)
 				if err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 				defer bodyReader.(*gzip.Reader).Close()
 			}
 		default:
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	body, err := io.ReadAll(bodyReader)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	return &Response{
 		StatusCode: res.StatusCode,
 		Body:       body,
 		Headers:    &res.Header,
-	}, nil
+	}, finalRequest.URL, nil
 }
 
 func (h *httpBackend) Limit(rule *LimitRule) error {

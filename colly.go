@@ -216,7 +216,21 @@ type key int
 const (
 	ProxyURLKey key = iota
 	CheckRevisitKey
+	// redirectHopsKey is the context key for the *redirectChain recording
+	// the redirect targets of a request.
+	redirectHopsKey
 )
+
+// redirectChain records the redirect targets of a single request in the
+// order they are followed. A pointer to it is carried in the request
+// context: checkRedirectFunc appends each redirect destination while the
+// HTTP client follows the chain, and httpBackend.Cache persists the
+// chain in the cache entry so that a later cache hit can re-validate it
+// against the collector's current configuration. Redirects of one
+// request are followed sequentially, so no locking is required.
+type redirectChain struct {
+	hops []string
+}
 
 // The prefix for environment variables of Colly settings
 const envVariablePrefix = "COLLY_"
@@ -732,6 +746,9 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 		hTrace = &HTTPTrace{}
 		req = hTrace.WithTrace(req)
 	}
+	// Record the redirect chain in the request context so the backend can
+	// persist it in the cache entry and re-validate it on cache hits.
+	req = req.WithContext(context.WithValue(req.Context(), redirectHopsKey, &redirectChain{}))
 	origURL := req.URL
 	checkResponseHeadersFunc := func(req *http.Request, statusCode int, headers http.Header) bool {
 		if req.URL != origURL {
@@ -745,7 +762,10 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 		c.handleOnRequestHeaders(request)
 		return !request.abort
 	}
-	response, err := c.backend.Cache(req, c.MaxBodySize, checkRequestHeadersFunc, checkResponseHeadersFunc, c.CacheDir, c.CacheExpiration)
+	checkCachedRedirectsFunc := func(hops []string) (bool, error) {
+		return c.checkCachedRedirects(req.URL.String(), hops, req.Context())
+	}
+	response, err := c.backend.Cache(req, c.MaxBodySize, checkRequestHeadersFunc, checkResponseHeadersFunc, checkCachedRedirectsFunc, c.CacheDir, c.CacheExpiration)
 	if proxyURL, ok := req.Context().Value(ProxyURLKey).(string); ok {
 		request.ProxyURL = proxyURL
 	}
@@ -1477,6 +1497,9 @@ func (c *Collector) Clone() *Collector {
 
 func (c *Collector) checkRedirectFunc() func(req *http.Request, via []*http.Request) error {
 	return func(req *http.Request, via []*http.Request) error {
+		if chain, ok := req.Context().Value(redirectHopsKey).(*redirectChain); ok {
+			chain.hops = append(chain.hops, req.URL.String())
+		}
 		if err := c.checkFilters(req.URL.String(), req.URL.Hostname()); err != nil {
 			return fmt.Errorf("Not following redirect to %q: %w", req.URL, err)
 		}
@@ -1544,6 +1567,71 @@ func (c *Collector) checkRedirectFunc() func(req *http.Request, via []*http.Requ
 
 		return nil
 	}
+}
+
+// checkCachedRedirects re-validates the redirect chain of a cached
+// response against the collector's current domain/URL filters and
+// revisit rules, mirroring the checks checkRedirectFunc performs while
+// following redirects live. It returns refetch=true when the chain
+// cannot be replayed from cache — a custom redirect handler is set,
+// whose semantics must be observed live, or a hop URL cannot be parsed —
+// and the request must be sent to the origin server. A non-nil error
+// rejects the cached response with the same error category a live
+// redirect would have produced; in that case neither the cached body is
+// delivered nor the origin server contacted.
+func (c *Collector) checkCachedRedirects(origURL string, hops []string, ctx context.Context) (refetch bool, err error) {
+	if len(hops) == 0 {
+		return false, nil
+	}
+	if c.redirectHandler != nil {
+		// A custom redirect handler may have arbitrary side effects and
+		// cannot be replayed from a cache entry. Fall back to the origin
+		// server so the handler observes the live redirect chain.
+		return true, nil
+	}
+	checkRevisit := true
+	if v, ok := ctx.Value(CheckRevisitKey).(bool); ok {
+		checkRevisit = v
+	}
+	for i, hop := range hops {
+		hopURL, err := url.Parse(hop)
+		if err != nil {
+			return true, nil
+		}
+		if err := c.checkFilters(hop, hopURL.Hostname()); err != nil {
+			return false, fmt.Errorf("Not following redirect to %q: %w", hopURL, err)
+		}
+		if c.AllowURLRevisit {
+			continue
+		}
+		// Mirror the redirect-cycle exemption of checkRedirectFunc: a
+		// hop repeating the original URL or an earlier hop of the same
+		// chain is part of a redirect cycle and must not raise
+		// AlreadyVisitedError.
+		normalizedHop := normalizeURL(hop)
+		cycle := normalizeURL(origURL) == normalizedHop
+		for _, prev := range hops[:i] {
+			if normalizeURL(prev) == normalizedHop {
+				cycle = true
+				break
+			}
+		}
+		if cycle {
+			continue
+		}
+		uHash := requestHash(hop, nil)
+		visited, err := c.store.IsVisited(uHash)
+		if err != nil {
+			return false, err
+		}
+		if visited && checkRevisit {
+			return false, &AlreadyVisitedError{hopURL}
+		}
+		if err := c.store.Visited(uHash); err != nil {
+			return false, err
+		}
+	}
+	return false, nil
 }
 
 func (c *Collector) parseSettingsFromEnv() {
