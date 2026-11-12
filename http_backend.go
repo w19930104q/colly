@@ -27,6 +27,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"compress/gzip"
@@ -38,6 +39,11 @@ type httpBackend struct {
 	LimitRules []*LimitRule
 	Client     *http.Client
 	lock       *sync.RWMutex
+	// hopEnabled is set once a LimitRule with Hop: true is registered.
+	// While false, request contexts are not marked and the limiting
+	// Transport is not installed, so collectors using only the classic
+	// rules keep the historical behavior and code path.
+	hopEnabled atomic.Bool
 }
 
 type checkResponseHeadersFunc func(req *http.Request, statusCode int, header http.Header) bool
@@ -49,6 +55,26 @@ type checkRequestHeadersFunc func(req *http.Request) bool
 // There can be two kind of limitations:
 //   - Parallelism: Set limit for the number of concurrent requests to matching domains
 //   - Delay: Wait specified amount of time between requests (parallelism is 1 in this case)
+//
+// By default (Hop is false) a rule applies in the classic mode: limiting
+// happens around Collector-level requests and Delay is slept after the
+// whole request finishes. Setting Hop to true enables hop-by-hop rate
+// limiting, which differs as follows:
+//   - every HTTP hop counts against Parallelism, including robots.txt
+//     fetches, redirects (one per redirect response) and Retry attempts;
+//   - a slot is held from the moment the hop is sent until its response
+//     body is closed, after which the rule cools down for Delay plus a
+//     random fraction of RandomDelay before another hop may be sent;
+//     failed and aborted attempts cool down as well;
+//   - cache hits occupy no slot and are never counted;
+//   - waiting for a slot or for the cooldown honors the Collector's
+//     Context: a cancelled Collector sends no further hops, while the
+//     cancellation neither releases in-flight slots early nor shortens
+//     the cooldown for the remaining waiters.
+//
+// A rule shared between a Collector and its clones (the HTTP backend is
+// shared by Clone) counts against the same Parallelism budget, whereas
+// distinct rules are scheduled independently.
 type LimitRule struct {
 	// DomainRegexp is a regular expression to match against domains
 	DomainRegexp string
@@ -59,7 +85,18 @@ type LimitRule struct {
 	// RandomDelay is the extra randomized duration to wait added to Delay before creating a new request
 	RandomDelay time.Duration
 	// Parallelism is the number of the maximum allowed concurrent requests of the matching domains
-	Parallelism    int
+	Parallelism int
+	// Hop enables hop-by-hop rate limiting for this rule. It defaults to
+	// false, i.e. the classic Collector-level limiting is used.
+	Hop bool
+	// clock is the time source of the hop-by-hop scheduler. It is nil in
+	// production (real time is used) and may be replaced by tests to run
+	// deterministic, controlled-clock regressions.
+	clock clock
+	// gate is the lazily initialized hop-by-hop scheduler. It is shared
+	// by every Collector whose backend registered this rule, including
+	// clones, so the rule's Parallelism budget is shared as well.
+	gate           *hopGate
 	waitChan       chan bool
 	compiledRegexp *regexp.Regexp
 	compiledGlob   *glob.Pattern
@@ -107,9 +144,9 @@ func (r *LimitRule) Init() error {
 }
 
 // Clone returns a shallow copy of the LimitRule containing only its
-// exported fields. Unexported state (waitChan, compiled patterns, lock)
-// is left zero so the returned rule is independent of the original and
-// must be re-initialized via Init before use.
+// exported fields. Unexported state (waitChan, gate, compiled patterns,
+// lock, clock) is left zero so the returned rule is independent of the
+// original and must be re-initialized via Init before use.
 func (r *LimitRule) Clone() *LimitRule {
 	return &LimitRule{
 		DomainRegexp: r.DomainRegexp,
@@ -117,6 +154,7 @@ func (r *LimitRule) Clone() *LimitRule {
 		Delay:        r.Delay,
 		RandomDelay:  r.RandomDelay,
 		Parallelism:  r.Parallelism,
+		Hop:          r.Hop,
 	}
 }
 
@@ -201,7 +239,7 @@ func (h *httpBackend) Cache(request *http.Request, bodySize int, checkRequestHea
 
 func (h *httpBackend) Do(request *http.Request, bodySize int, checkRequestHeadersFunc checkRequestHeadersFunc, checkResponseHeadersFunc checkResponseHeadersFunc) (*Response, error) {
 	r := h.GetMatchingRule(request.URL.Host)
-	if r != nil {
+	if r != nil && !r.Hop {
 		r.waitChan <- true
 		defer func(r *LimitRule) {
 			randomDelay := time.Duration(0)
@@ -212,6 +250,9 @@ func (h *httpBackend) Do(request *http.Request, bodySize int, checkRequestHeader
 			<-r.waitChan
 		}(r)
 	}
+	// Hop rules are enforced at the Transport (see hop_limit.go): every
+	// redirect hop is scheduled there, cache hits never reach the
+	// Transport, and slot release is tied to the response body close.
 	if !checkRequestHeadersFunc(request) {
 		return nil, ErrAbortedBeforeRequest
 	}
@@ -277,7 +318,13 @@ func (h *httpBackend) Limit(rule *LimitRule) error {
 	}
 	h.LimitRules = append(h.LimitRules, rule)
 	h.lock.Unlock()
-	return rule.Init()
+	if err := rule.Init(); err != nil {
+		return err
+	}
+	if rule.Hop {
+		h.enableHopLimiting()
+	}
+	return nil
 }
 
 func (h *httpBackend) Limits(rules []*LimitRule) error {

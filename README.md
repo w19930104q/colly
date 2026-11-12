@@ -66,6 +66,34 @@ Free trialfor new users - use promocode **COLLY** to claim 3GB of proxy
 -   Configuration via environment variables
 -   Extensions
 
+## Rate limiting
+
+Use `Collector.Limit` to throttle requests per domain via `LimitRule`. The
+classic mode (the default) limits whole Collector-level requests. Set the
+rule's `Hop` field to `true` to enable **hop-by-hop rate limiting**:
+
+```go
+c.Limit(&colly.LimitRule{
+    DomainGlob:  "*example.com*",
+    Parallelism: 2,
+    Delay:       100 * time.Millisecond,
+    RandomDelay: 50 * time.Millisecond,
+    Hop:         true,
+})
+```
+
+In hop mode every HTTP hop — robots.txt fetches, each redirect, and
+`Retry` attempts — counts against `Parallelism` and is matched by the
+target host. A slot is held from when the hop is sent until its response
+body is closed, after which the rule cools down for `Delay` plus a random
+fraction of `RandomDelay`; failed attempts cool down too. Cache hits
+occupy no slot. A rule shared by a `Collector` and its clones shares the
+same budget, while distinct rules stay independent. Waiting for a slot or
+the cooldown honors the collector's `Context`: a cancelled collector sends
+no further hops, and `Wait()` still drains cleanly. Injected
+`http.Client`/`http.RoundTripper` values keep working; calling them
+directly is never throttled.
+
 ## Example
 
 ```go

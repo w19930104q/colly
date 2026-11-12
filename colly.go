@@ -537,6 +537,7 @@ func (c *Collector) Appengine(ctx context.Context) {
 	client.Timeout = c.backend.Client.Timeout
 
 	c.backend.Client = client
+	c.backend.ensureHopTransport()
 }
 
 // Visit starts Collector's collecting job by creating a
@@ -683,6 +684,10 @@ func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, c
 	// note: once 1.13 is minimum supported Go version,
 	// replace this with http.NewRequestWithContext
 	req = req.WithContext(context.WithValue(c.Context, CheckRevisitKey, checkRevisit))
+	// Mark Collector-originated requests so the hop-by-hop limiting
+	// Transport (installed only when a Hop rule exists) can distinguish
+	// them from external, direct uses of the injected Client/Transport.
+	req = req.WithContext(c.backend.markHopContext(req.Context()))
 
 	if err := c.requestCheck(parsedURL, method, req.GetBody, depth, checkRevisit); err != nil {
 		return err
@@ -891,6 +896,12 @@ func (c *Collector) checkRobots(u *url.URL) error {
 		if hostHeader := hdr.Get("Host"); hostHeader != "" {
 			req.Host = hostHeader
 		}
+		// In hop mode the robots.txt fetch is itself a counted hop and
+		// must respond to Collector cancellation; in classic mode the
+		// request keeps its background context exactly as before.
+		if c.backend.hopEnabled.Load() {
+			req = req.WithContext(c.backend.markHopContext(c.Context))
+		}
 
 		resp, err := c.backend.Client.Do(req)
 		if err != nil {
@@ -1067,13 +1078,23 @@ func (c *Collector) OnScraped(f ScrapedCallback) {
 	c.lock.Unlock()
 }
 
-// SetClient will override the previously set http.Client
+// SetClient will override the previously set http.Client.
+// If hop-by-hop limiting is active, the new client's Transport is
+// wrapped transparently; direct external use of the client stays
+// unthrottled because only Collector-marked requests are limited.
 func (c *Collector) SetClient(client *http.Client) {
 	c.backend.Client = client
+	c.backend.ensureHopTransport()
 }
 
-// WithTransport allows you to set a custom http.RoundTripper (transport)
+// WithTransport allows you to set a custom http.RoundTripper (transport).
+// When hop-by-hop limiting is active the transport is installed as the
+// delegate of the limiting wrapper rather than replacing it.
 func (c *Collector) WithTransport(transport http.RoundTripper) {
+	if t, ok := c.backend.Client.Transport.(*hopLimitTransport); ok {
+		t.base = transport
+		return
+	}
 	c.backend.Client.Transport = transport
 }
 
